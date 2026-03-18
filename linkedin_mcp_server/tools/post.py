@@ -20,8 +20,12 @@ class ImagePostParams(BaseModel):
     visibility: str = Field(default="PUBLIC")
 
 class CommentParams(BaseModel):
-    object_urn: str = Field(..., description="The URN of the post/share to comment on (e.g., urn:li:share:123)")
+    object_urn: str = Field(..., description="The URN of the post/share to comment on (e.g., urn:li:share:123, urn:li:activity:123)")
     text: str = Field(..., description="The text content of the comment.")
+
+class ReactionParams(BaseModel):
+    object_urn: str = Field(..., description="The URN of the content to react to (e.g., urn:li:activity:123, urn:li:share:123)")
+    reaction_type: str = Field(default="LIKE", description="Reaction type: LIKE, PRAISE, APPRECIATION, EMPATHY, INTEREST, ENTERTAINMENT")
 
 class UpdatePostParams(BaseModel):
     post_urn: str = Field(..., description="The URN of the post to update.")
@@ -264,6 +268,32 @@ async def create_comment(params: CommentParams) -> str:
             comment_id = resp.json().get("id")
             return f"✅ Comment created successfully.\nID: {comment_id}"
             
+    except Exception as e:
+        return handle_api_error(e)
+
+async def create_reaction(params: ReactionParams) -> str:
+    """Create a reaction (like) on a LinkedIn post."""
+    try:
+        headers = await get_headers()
+        async with httpx.AsyncClient() as client:
+            user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
+            user_resp.raise_for_status()
+            person_id = user_resp.json().get("sub")
+            actor_urn = f"urn:li:person:{person_id}"
+
+            encoded_object = quote(params.object_urn)
+            url = f"{settings.api_base}/socialActions/{encoded_object}/likes"
+
+            payload = {
+                "actor": actor_urn,
+                "object": params.object_urn,
+                "reactionType": params.reaction_type
+            }
+
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            return f"✅ Reaction ({params.reaction_type}) added successfully to {params.object_urn}"
+
     except Exception as e:
         return handle_api_error(e)
 

@@ -85,6 +85,17 @@ async def linkedin_create_comment(object_urn: str, text: str) -> str:
     params = post.CommentParams(object_urn=object_urn, text=text)
     return await post.create_comment(params)
 
+@mcp.tool(name="linkedin_create_reaction", annotations={"title": "Like/React to Post"})
+async def linkedin_create_reaction(object_urn: str, reaction_type: str = "LIKE") -> str:
+    """
+    Like or react to a LinkedIn post.
+    Args:
+        object_urn: The URN of the content to react to (e.g., 'urn:li:activity:123', 'urn:li:share:123').
+        reaction_type: LIKE, PRAISE, APPRECIATION, EMPATHY, INTEREST, ENTERTAINMENT (default: LIKE).
+    """
+    params = post.ReactionParams(object_urn=object_urn, reaction_type=reaction_type)
+    return await post.create_reaction(params)
+
 @mcp.tool(name="linkedin_get_post_comments", annotations={"title": "Get Comments"})
 async def linkedin_get_post_comments(object_urn: str) -> str:
     """Get comments for a specific post/share."""
