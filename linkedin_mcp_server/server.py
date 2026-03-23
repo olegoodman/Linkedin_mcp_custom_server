@@ -32,26 +32,37 @@ async def linkedin_get_member_profile(member_urn: str) -> str:
 # --- Post Tools ---
 
 @mcp.tool(name="linkedin_create_post", annotations={"title": "Create Feed Post"})
-async def linkedin_create_post(text: str, visibility: str = "PUBLIC") -> str:
+async def linkedin_create_post(text: str, visibility: str = "PUBLIC", mentions: str = None) -> str:
     """
     Create a new text-based update on the user LinkedIn feed.
     Args:
         text: The content of the post.
         visibility: 'PUBLIC' or 'CONNECTIONS'.
+        mentions: JSON array of mentions. Each item: {"text": "Display Name", "urn": "urn:li:person:ID"} or {"text": "Company", "urn": "urn:li:organization:ID"}. The text must appear in the post text exactly.
     """
-    params = post.PostParams(text=text, visibility=visibility)
+    mention_items = None
+    if mentions:
+        import json as _json
+        mention_items = [post.MentionItem(**m) for m in _json.loads(mentions)]
+    params = post.PostParams(text=text, visibility=visibility, mentions=mention_items)
     return await post.create_post(params)
 
 @mcp.tool(name="linkedin_create_image_post", annotations={"title": "Create Image Post"})
-async def linkedin_create_image_post(text: str, image_source: str, visibility: str = "PUBLIC") -> str:
+async def linkedin_create_image_post(text: str, image_source: str, visibility: str = "PUBLIC", alt_text: str = None, mentions: str = None) -> str:
     """
     Create a post with an image.
     Args:
         text: Post caption.
         image_source: Local file path or public URL of the image.
         visibility: 'PUBLIC' or 'CONNECTIONS'.
+        alt_text: Alt text for the image (accessibility and SEO). Describes what the image shows.
+        mentions: JSON array of mentions. Each item: {"text": "Display Name", "urn": "urn:li:person:ID"} or {"text": "Company", "urn": "urn:li:organization:ID"}. The text must appear in the post text exactly.
     """
-    params = post.ImagePostParams(text=text, image_source=image_source, visibility=visibility)
+    mention_items = None
+    if mentions:
+        import json as _json
+        mention_items = [post.MentionItem(**m) for m in _json.loads(mentions)]
+    params = post.ImagePostParams(text=text, image_source=image_source, visibility=visibility, alt_text=alt_text, mentions=mention_items)
     return await post.create_image_post(params)
 
 @mcp.tool(name="linkedin_update_post", annotations={"title": "Update Post"})

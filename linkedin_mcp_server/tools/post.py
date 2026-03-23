@@ -9,15 +9,23 @@ from urllib.parse import quote
 
 # --- Models ---
 
+class MentionItem(BaseModel):
+    """A single mention to embed in post text."""
+    text: str = Field(..., description="The display text in the post to turn into a mention (e.g., 'Shabad Singh').")
+    urn: str = Field(..., description="LinkedIn URN: 'urn:li:person:ID' for people or 'urn:li:organization:ID' for companies.")
+
 class PostParams(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     text: str = Field(..., description="The commentary/text content of the post.")
     visibility: str = Field(default="PUBLIC", description="Post visibility: PUBLIC or CONNECTIONS.")
+    mentions: Optional[List[MentionItem]] = Field(default=None, description="List of mentions to embed in the post text.")
 
 class ImagePostParams(BaseModel):
     text: str = Field(..., description="The text content.")
     image_source: str = Field(..., description="Local file path or public URL of the image.")
     visibility: str = Field(default="PUBLIC")
+    alt_text: Optional[str] = Field(default=None, description="Alt text for the image (accessibility + SEO).")
+    mentions: Optional[List[MentionItem]] = Field(default=None, description="List of mentions to embed in the post text.")
 
 class CommentParams(BaseModel):
     object_urn: str = Field(..., description="The URN of the post/share to comment on (e.g., urn:li:share:123, urn:li:activity:123)")
@@ -31,6 +39,38 @@ class UpdatePostParams(BaseModel):
     post_urn: str = Field(..., description="The URN of the post to update.")
     text: str = Field(..., description="The new text content.")
     visibility: str = Field(default="PUBLIC", description="Visibility for the new post: PUBLIC or CONNECTIONS.")
+
+# --- Helper: Mentions ---
+
+def build_mention_attributes(text: str, mentions: Optional[List[MentionItem]]) -> List[dict]:
+    """Build LinkedIn UGC shareCommentary attributes for @mentions.
+
+    Scans the post text for each mention's display text and creates
+    the attribute entry with correct start position and length.
+    """
+    if not mentions:
+        return []
+
+    attributes = []
+    for mention in mentions:
+        start = text.find(mention.text)
+        if start == -1:
+            continue
+
+        if mention.urn.startswith("urn:li:person:"):
+            value = {"com.linkedin.common.MemberAttributedEntity": {"member": mention.urn}}
+        elif mention.urn.startswith("urn:li:organization:"):
+            value = {"com.linkedin.common.CompanyAttributedEntity": {"company": mention.urn}}
+        else:
+            continue
+
+        attributes.append({
+            "start": start,
+            "length": len(mention.text),
+            "value": value
+        })
+
+    return attributes
 
 # --- Helper: Image Upload ---
 
@@ -96,17 +136,23 @@ async def create_image_post(params: ImagePostParams) -> str:
             asset_urn = await upload_image(client, headers, author_urn, params.image_source)
             
             # 3. Create Post
+            commentary = {"text": params.text}
+            attributes = build_mention_attributes(params.text, params.mentions)
+            if attributes:
+                commentary["attributes"] = attributes
+
+            media_description = params.alt_text or "Image"
             payload = {
                 "author": author_urn,
                 "lifecycleState": "PUBLISHED",
                 "specificContent": {"com.linkedin.ugc.ShareContent": {
-                    "shareCommentary": {"text": params.text},
+                    "shareCommentary": commentary,
                     "shareMediaCategory": "IMAGE",
                     "media": [{
                         "status": "READY",
-                        "description": {"text": "Image"},
+                        "description": {"text": media_description},
                         "media": asset_urn,
-                        "title": {"text": "Image Post"}
+                        "title": {"text": media_description}
                     }]
                 }},
                 "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": params.visibility}
@@ -133,11 +179,16 @@ async def create_post(params: PostParams) -> str:
             author = f"urn:li:person:{person_id}"
 
             # 2. Construct Payload
+            commentary = {"text": params.text}
+            attributes = build_mention_attributes(params.text, params.mentions)
+            if attributes:
+                commentary["attributes"] = attributes
+
             payload = {
-                "author": author, 
+                "author": author,
                 "lifecycleState": "PUBLISHED",
                 "specificContent": {"com.linkedin.ugc.ShareContent": {
-                    "shareCommentary": {"text": params.text}, 
+                    "shareCommentary": commentary,
                     "shareMediaCategory": "NONE"
                 }},
                 "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": params.visibility}
