@@ -7,6 +7,8 @@ from ..utils import get_headers, handle_api_error
 from ..config import settings
 from urllib.parse import quote
 
+LINKEDIN_VERSION = "202601"
+
 # --- Models ---
 
 class MentionItem(BaseModel):
@@ -42,283 +44,275 @@ class UpdatePostParams(BaseModel):
 
 # --- Helper: Mentions ---
 
-def build_mention_attributes(text: str, mentions: Optional[List[MentionItem]]) -> List[dict]:
-    """Build LinkedIn UGC shareCommentary attributes for @mentions.
+def build_mention_commentary(text: str, mentions: Optional[List[MentionItem]]) -> str:
+    """Transform text by replacing mention display text with Posts API inline annotation syntax.
 
-    Scans the post text for each mention's display text and creates
-    the attribute entry with correct start position and length.
+    For Posts API, mentions use: @[DisplayName](urn:li:type:id)
+    Replacements are done from end to start to preserve positions.
+    IMPORTANT: Only works at post CREATION time, not with PARTIAL_UPDATE.
     """
     if not mentions:
-        return []
+        return text
 
-    attributes = []
+    positioned = []
     for mention in mentions:
         start = text.find(mention.text)
-        if start == -1:
-            continue
+        if start != -1:
+            positioned.append((start, mention))
 
-        if mention.urn.startswith("urn:li:person:"):
-            value = {"com.linkedin.common.MemberAttributedEntity": {"member": mention.urn}}
-        elif mention.urn.startswith("urn:li:organization:"):
-            value = {"com.linkedin.common.CompanyAttributedEntity": {"company": mention.urn}}
-        else:
-            continue
+    positioned.sort(key=lambda x: x[0], reverse=True)
 
-        attributes.append({
-            "start": start,
-            "length": len(mention.text),
-            "value": value
-        })
+    for start, mention in positioned:
+        end = start + len(mention.text)
+        annotation = f"@[{mention.text}]({mention.urn})"
+        text = text[:start] + annotation + text[end:]
 
-    return attributes
+    return text
 
-# --- Helper: Image Upload ---
+# --- Helper: REST API headers ---
+
+def _rest_headers(headers: dict) -> dict:
+    """Add Linkedin-Version header for /rest/ endpoints."""
+    return {**headers, "Linkedin-Version": LINKEDIN_VERSION}
+
+# --- Helper: Image Upload (Images API) ---
 
 async def upload_image(client: httpx.AsyncClient, headers: dict, person_urn: str, image_source: str) -> str:
+    """Upload image via LinkedIn Images API.
+
+    1. POST /rest/images?action=initializeUpload → get uploadUrl + image URN
+    2. PUT binary to uploadUrl
+    3. Return image URN (urn:li:image:XXX)
     """
-    Handles the 3-step image upload process:
-    1. Register Upload -> Get upload URL and Asset URN.
-    2. Upload Image Binary.
-    3. Return Asset URN.
-    """
-    # Step 1: Register
-    reg_url = f"{settings.api_base}/assets?action=registerUpload"
-    reg_body = {
-        "registerUploadRequest": {
-            "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
-            "owner": person_urn,
-            "serviceRelationships": [{"relationshipType": "OWNER", "identifier": "urn:li:userGeneratedContent"}]
-        }
-    }
-    
-    reg_resp = await client.post(reg_url, headers=headers, json=reg_body)
-    reg_resp.raise_for_status()
-    reg_data = reg_resp.json()
-    
-    upload_url = reg_data['value']['uploadMechanism']['com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest']['uploadUrl']
-    asset_urn = reg_data['value']['asset']
-    
-    # Step 2: Get Image Data
+    rest_base = settings.api_base.replace("/v2", "/rest")
+    rest_h = _rest_headers(headers)
+
+    # Step 1: Initialize Upload
+    init_resp = await client.post(
+        f"{rest_base}/images?action=initializeUpload",
+        headers=rest_h,
+        json={"initializeUploadRequest": {"owner": person_urn}},
+    )
+    init_resp.raise_for_status()
+    init_data = init_resp.json()
+
+    upload_url = init_data["value"]["uploadUrl"]
+    image_urn = init_data["value"]["image"]
+
+    # Step 2: Read image data
     if image_source.startswith("http"):
-        # Download from URL
         img_resp = await client.get(image_source)
         img_resp.raise_for_status()
         image_data = img_resp.content
     else:
-        # Read from local file
         if not os.path.exists(image_source):
             raise FileNotFoundError(f"Image file not found: {image_source}")
         with open(image_source, "rb") as f:
             image_data = f.read()
-            
-    # Step 3: Upload Binary
-    # Use the same token for upload if required, though typically it's a signed URL
+
+    # Step 3: Upload binary
     upload_headers = {"Authorization": headers["Authorization"]}
     upload_resp = await client.put(upload_url, headers=upload_headers, content=image_data)
     upload_resp.raise_for_status()
-    
-    return asset_urn
 
-# --- Post Implementation ---
+    return image_urn
+
+# --- Post Implementation (Posts API) ---
 
 async def create_image_post(params: ImagePostParams) -> str:
-    """Create a post with an image."""
+    """Create a post with an image via Posts API (/rest/posts)."""
     try:
         headers = await get_headers()
+        rest_base = settings.api_base.replace("/v2", "/rest")
+        rest_h = _rest_headers(headers)
+
         async with httpx.AsyncClient() as client:
             # 1. Get User ID
             user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
             user_resp.raise_for_status()
             person_id = user_resp.json().get("sub")
             author_urn = f"urn:li:person:{person_id}"
-            
-            # 2. Upload Image
-            asset_urn = await upload_image(client, headers, author_urn, params.image_source)
-            
-            # 3. Create Post
-            commentary = {"text": params.text}
-            attributes = build_mention_attributes(params.text, params.mentions)
-            if attributes:
-                commentary["attributes"] = attributes
 
-            media_description = params.alt_text or "Image"
+            # 2. Upload Image via Images API
+            image_urn = await upload_image(client, headers, author_urn, params.image_source)
+
+            # 3. Build commentary with inline mentions
+            commentary = build_mention_commentary(params.text, params.mentions)
+
+            # 4. Build media content
+            media_content = {"id": image_urn}
+            if params.alt_text:
+                media_content["altText"] = params.alt_text
+
+            # 5. Create Post via Posts API
             payload = {
                 "author": author_urn,
+                "commentary": commentary,
+                "visibility": params.visibility,
+                "distribution": {
+                    "feedDistribution": "MAIN_FEED",
+                    "targetEntities": [],
+                    "thirdPartyDistributionChannels": [],
+                },
+                "content": {"media": media_content},
                 "lifecycleState": "PUBLISHED",
-                "specificContent": {"com.linkedin.ugc.ShareContent": {
-                    "shareCommentary": commentary,
-                    "shareMediaCategory": "IMAGE",
-                    "media": [{
-                        "status": "READY",
-                        "description": {"text": media_description},
-                        "media": asset_urn,
-                        "title": {"text": media_description}
-                    }]
-                }},
-                "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": params.visibility}
+                "isReshareDisabledByAuthor": False,
             }
-            
-            resp = await client.post(f"{settings.api_base}/ugcPosts", headers=headers, json=payload)
+
+            resp = await client.post(f"{rest_base}/posts", headers=rest_h, json=payload)
             resp.raise_for_status()
-            
-            post_id = resp.json().get("id")
+
+            post_id = resp.headers.get("x-restli-id", "unknown")
             return f"✅ Image Post created successfully.\nID: {post_id}"
 
     except Exception as e:
         return handle_api_error(e)
 
 async def create_post(params: PostParams) -> str:
-    """Create a new text-based update on the user LinkedIn feed."""
+    """Create a new text-based update on the user LinkedIn feed via Posts API (/rest/posts)."""
     try:
         headers = await get_headers()
+        rest_base = settings.api_base.replace("/v2", "/rest")
+        rest_h = _rest_headers(headers)
+
         async with httpx.AsyncClient() as client:
-            # 1. Get User ID (sub) to construct Author URN
+            # 1. Get User ID
             user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
             user_resp.raise_for_status()
             person_id = user_resp.json().get("sub")
             author = f"urn:li:person:{person_id}"
 
-            # 2. Construct Payload
-            commentary = {"text": params.text}
-            attributes = build_mention_attributes(params.text, params.mentions)
-            if attributes:
-                commentary["attributes"] = attributes
+            # 2. Build commentary with inline mentions
+            commentary = build_mention_commentary(params.text, params.mentions)
 
+            # 3. Construct Payload
             payload = {
                 "author": author,
+                "commentary": commentary,
+                "visibility": params.visibility,
+                "distribution": {
+                    "feedDistribution": "MAIN_FEED",
+                    "targetEntities": [],
+                    "thirdPartyDistributionChannels": [],
+                },
                 "lifecycleState": "PUBLISHED",
-                "specificContent": {"com.linkedin.ugc.ShareContent": {
-                    "shareCommentary": commentary,
-                    "shareMediaCategory": "NONE"
-                }},
-                "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": params.visibility}
+                "isReshareDisabledByAuthor": False,
             }
-            
-            # 3. Send Request
-            resp = await client.post(f"{settings.api_base}/ugcPosts", headers=headers, json=payload)
+
+            # 4. Send Request
+            resp = await client.post(f"{rest_base}/posts", headers=rest_h, json=payload)
             resp.raise_for_status()
-            
-            post_id = resp.json().get("id")
+
+            post_id = resp.headers.get("x-restli-id", "unknown")
             return f"✅ Post created successfully.\nID: {post_id}"
-            
+
     except Exception as e:
         return handle_api_error(e)
 
 async def update_post(params: UpdatePostParams) -> str:
     """
     Update a post by deleting the old one and creating a new one.
-    (LinkedIn API does not support direct text edits).
+    (LinkedIn API does not support adding mentions via PARTIAL_UPDATE).
     """
     try:
-        # 1. Delete the old post
         delete_result = await delete_post(params.post_urn)
-        
+
         if "Error" in delete_result:
             return f"Update Failed during deletion step: {delete_result}"
-            
-        # 2. Create the new post
+
         create_params = PostParams(text=params.text, visibility=params.visibility)
         create_result = await create_post(create_params)
-        
+
         if "Error" in create_result:
             return f"⚠️ Old post deleted, but creation failed: {create_result}"
-            
+
         return f"✅ Post updated (Re-created).\nOld ID: {params.post_urn}\n{create_result}"
 
     except Exception as e:
         return handle_api_error(e)
 
 async def delete_post(post_urn: str) -> str:
-    """Delete a LinkedIn post by its URN."""
+    """Delete a LinkedIn post by its URN via Posts API."""
     try:
         headers = await get_headers()
-        # Ensure URN is URL encoded for the path
+        rest_base = settings.api_base.replace("/v2", "/rest")
+        rest_h = {**_rest_headers(headers), "X-RestLi-Method": "DELETE"}
         encoded_urn = quote(post_urn)
-        
+
         async with httpx.AsyncClient() as client:
-            resp = await client.delete(f"{settings.api_base}/ugcPosts/{encoded_urn}", headers=headers)
-            
+            resp = await client.delete(f"{rest_base}/posts/{encoded_urn}", headers=rest_h)
+
             if resp.status_code == 404:
                 return f"Error: Post {post_urn} not found."
-                
+
             resp.raise_for_status()
             return f"✅ Post {post_urn} deleted successfully."
-            
+
     except Exception as e:
         return handle_api_error(e)
 
 async def get_recent_posts() -> str:
-    """
-    List the user's recent posts. 
-    Note: Requires 'r_member_social' permission which is often restricted.
-    """
+    """List the user's recent posts via Posts API."""
     try:
         headers = await get_headers()
+        rest_base = settings.api_base.replace("/v2", "/rest")
+        rest_h = {**_rest_headers(headers), "X-RestLi-Method": "FINDER"}
+
         async with httpx.AsyncClient() as client:
             # 1. Get Author URN
             user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
             user_resp.raise_for_status()
             person_id = user_resp.json().get("sub")
             author_urn = f"urn:li:person:{person_id}"
-            
-            # 2. Search
+
+            # 2. Fetch posts
             encoded_author = quote(author_urn)
-            url = f"{settings.api_base}/ugcPosts?q=authors&authors=List({encoded_author})"
-            
-            resp = await client.get(url, headers=headers)
+            url = f"{rest_base}/posts?author={encoded_author}&q=author&count=10&sortBy=LAST_MODIFIED"
+
+            resp = await client.get(url, headers=rest_h)
             resp.raise_for_status()
-            
+
             data = resp.json()
             posts = []
             for item in data.get("elements", []):
-                # Extract text
-                content = item.get("specificContent", {}).get("com.linkedin.ugc.ShareContent", {})
-                text = content.get("shareCommentary", {}).get("text", "")
-                
                 posts.append({
                     "id": item.get("id"),
-                    "text": text,
-                    "created": item.get("created", {}).get("time"),
-                    "visibility": item.get("visibility", {}).get("com.linkedin.ugc.MemberNetworkVisibility")
+                    "text": item.get("commentary", ""),
+                    "created": item.get("createdAt"),
+                    "visibility": item.get("visibility"),
                 })
-            
+
             return json.dumps(posts, indent=2)
-            
+
     except Exception as e:
         return handle_api_error(e)
 
-# --- Comment Implementation ---
+# --- Comment Implementation (v2 Social Actions — still working) ---
 
 async def create_comment(params: CommentParams) -> str:
     """Create a comment on a share, UGC post, or article."""
     try:
         headers = await get_headers()
         async with httpx.AsyncClient() as client:
-            # 1. Get User ID
             user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
             user_resp.raise_for_status()
             person_id = user_resp.json().get("sub")
             actor_urn = f"urn:li:person:{person_id}"
-            
-            # 2. Payload
-            # LinkedIn Social Actions API uses 'socialActions' endpoint
-            # Path: /socialActions/{objectUrn}/comments
+
             encoded_object = quote(params.object_urn)
             url = f"{settings.api_base}/socialActions/{encoded_object}/comments"
-            
+
             payload = {
                 "actor": actor_urn,
-                "message": {
-                    "text": params.text
-                }
+                "message": {"text": params.text},
             }
-            
+
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
-            
+
             comment_id = resp.json().get("id")
             return f"✅ Comment created successfully.\nID: {comment_id}"
-            
+
     except Exception as e:
         return handle_api_error(e)
 
@@ -338,7 +332,7 @@ async def create_reaction(params: ReactionParams) -> str:
             payload = {
                 "actor": actor_urn,
                 "object": params.object_urn,
-                "reactionType": params.reaction_type
+                "reactionType": params.reaction_type,
             }
 
             resp = await client.post(url, headers=headers, json=payload)
@@ -354,11 +348,11 @@ async def get_post_comments(object_urn: str) -> str:
         headers = await get_headers()
         encoded_object = quote(object_urn)
         url = f"{settings.api_base}/socialActions/{encoded_object}/comments"
-        
+
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
-            
+
             data = resp.json()
             comments = []
             for item in data.get("elements", []):
@@ -366,43 +360,30 @@ async def get_post_comments(object_urn: str) -> str:
                     "id": item.get("id"),
                     "actor": item.get("actor"),
                     "text": item.get("message", {}).get("text"),
-                    "created": item.get("created", {}).get("time")
+                    "created": item.get("created", {}).get("time"),
                 })
             return json.dumps(comments, indent=2)
-            
+
     except Exception as e:
         return handle_api_error(e)
 
 async def delete_comment(comment_urn: str, object_urn: str) -> str:
-    """
-    Delete a comment. 
-    Note: Requires the parent object URN as well for the endpoint context in some versions, 
-    or direct access via ID. The standard Social Actions API is:
-    DELETE /socialActions/{objectUrn}/comments/{commentId}
-    """
+    """Delete a comment."""
     try:
         headers = await get_headers()
-        
-        # We need to extract the ID from the Comment URN if passed fully
-        # Comment URN format often: urn:li:comment:(urn:li:share:123, 456)
-        # But the API expects the call on the Object.
-        # User should provide Object URN and Comment ID ideally.
-        # For simplicity, we ask for both or try to parse.
-        
+
         encoded_object = quote(object_urn)
-        # Extract numeric ID if a full URN is passed, or use as is
         comment_id = comment_urn.split(",")[-1].replace(")", "") if "(" in comment_urn else comment_urn
         encoded_comment_id = quote(comment_id)
-        
+
         url = f"{settings.api_base}/socialActions/{encoded_object}/comments/{encoded_comment_id}"
-        
+
         async with httpx.AsyncClient() as client:
             resp = await client.delete(url, headers=headers)
             if resp.status_code == 404:
                 return "Error: Comment or Object not found."
             resp.raise_for_status()
             return "✅ Comment deleted successfully."
-            
+
     except Exception as e:
         return handle_api_error(e)
-
