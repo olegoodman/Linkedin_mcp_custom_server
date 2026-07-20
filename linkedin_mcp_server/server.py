@@ -65,6 +65,26 @@ async def linkedin_create_image_post(text: str, image_source: str, visibility: s
     params = post.ImagePostParams(text=text, image_source=image_source, visibility=visibility, alt_text=alt_text, mentions=mention_items)
     return await post.create_image_post(params)
 
+@mcp.tool(name="linkedin_create_document_post", annotations={"title": "Create Document (PDF Carousel) Post"})
+async def linkedin_create_document_post(text: str, file_source: str, title: str, visibility: str = "PUBLIC", mentions: str = None) -> str:
+    """
+    Create a document post — a PDF rendered as a swipeable in-feed carousel.
+    This is the highest-reach organic format on LinkedIn; it is ranked largely on
+    dwell time, and swiping through pages builds dwell.
+    Args:
+        text: Post body. Only the first 1-2 lines show before "see more" — put the hook there.
+        file_source: Local file path or public URL of the PDF. Must be under 10 MB; 4:5 portrait pages read best.
+        title: Label shown above the carousel in the feed.
+        visibility: 'PUBLIC' or 'CONNECTIONS'.
+        mentions: JSON array of mentions. Each item: {"text": "Display Name", "urn": "urn:li:person:ID"} or {"text": "Company", "urn": "urn:li:organization:ID"}. The text must appear in the post text exactly.
+    """
+    mention_items = None
+    if mentions:
+        import json as _json
+        mention_items = [post.MentionItem(**m) for m in _json.loads(mentions)]
+    params = post.DocumentPostParams(text=text, file_source=file_source, title=title, visibility=visibility, mentions=mention_items)
+    return await post.create_document_post(params)
+
 @mcp.tool(name="linkedin_update_post", annotations={"title": "Update Post"})
 async def linkedin_update_post(post_urn: str, text: str, visibility: str = "PUBLIC") -> str:
     """

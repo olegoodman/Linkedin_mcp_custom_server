@@ -7,7 +7,9 @@ from ..utils import get_headers, handle_api_error
 from ..config import settings
 from urllib.parse import quote
 
-LINKEDIN_VERSION = "202601"
+# LinkedIn retires API versions after ~12 months; a stale value returns
+# 426 NONEXISTENT_VERSION. Override via env when the next one is retired.
+LINKEDIN_VERSION = os.getenv("LINKEDIN_VERSION", "202607")
 
 # --- Models ---
 
@@ -27,6 +29,13 @@ class ImagePostParams(BaseModel):
     image_source: str = Field(..., description="Local file path or public URL of the image.")
     visibility: str = Field(default="PUBLIC")
     alt_text: Optional[str] = Field(default=None, description="Alt text for the image (accessibility + SEO).")
+    mentions: Optional[List[MentionItem]] = Field(default=None, description="List of mentions to embed in the post text.")
+
+class DocumentPostParams(BaseModel):
+    text: str = Field(..., description="The commentary/text content of the post.")
+    file_source: str = Field(..., description="Local file path or public URL of the PDF. Must be under 10 MB; 4:5 portrait pages read best in-feed.")
+    title: str = Field(..., description="Title shown above the carousel in the feed (e.g. 'LEINOS Hard Oil 240 — 8 pages').")
+    visibility: str = Field(default="PUBLIC", description="Post visibility: PUBLIC or CONNECTIONS.")
     mentions: Optional[List[MentionItem]] = Field(default=None, description="List of mentions to embed in the post text.")
 
 class CommentParams(BaseModel):
@@ -75,6 +84,37 @@ def _rest_headers(headers: dict) -> dict:
     """Add Linkedin-Version header for /rest/ endpoints."""
     return {**headers, "Linkedin-Version": LINKEDIN_VERSION}
 
+def _upload_headers(headers: dict) -> dict:
+    """Headers for PUTting binary media to an upload URL.
+
+    Content-Type is mandatory. Without it the client library's default
+    (application/x-www-form-urlencoded) is sent and LinkedIn answers 400 with an
+    HTML error page instead of JSON, which makes the cause very hard to spot.
+    """
+    return {
+        "Authorization": headers["Authorization"],
+        "Content-Type": "application/octet-stream",
+    }
+
+# --- Helper: Author URN ---
+
+async def get_author_urn(client: httpx.AsyncClient, headers: dict) -> str:
+    """Resolve the authenticated member's person URN.
+
+    Uses /v2/me, NOT /v2/userinfo: userinfo is an OpenID Connect endpoint and
+    needs the 'openid' scope. With r_basicprofile it returns 401
+    INVALID_ACCESS_TOKEN, which looks like a bad token but is a wrong endpoint.
+
+    Note the member id is per-application — the same person has a different id
+    under a different client_id, so it must be fetched, never hardcoded.
+    """
+    resp = await client.get(f"{settings.api_base}/me", headers=headers)
+    resp.raise_for_status()
+    person_id = resp.json().get("id")
+    if not person_id:
+        raise ValueError("Could not resolve person id from /v2/me")
+    return f"urn:li:person:{person_id}"
+
 # --- Helper: Image Upload (Images API) ---
 
 async def upload_image(client: httpx.AsyncClient, headers: dict, person_urn: str, image_source: str) -> str:
@@ -111,11 +151,46 @@ async def upload_image(client: httpx.AsyncClient, headers: dict, person_urn: str
             image_data = f.read()
 
     # Step 3: Upload binary
-    upload_headers = {"Authorization": headers["Authorization"]}
-    upload_resp = await client.put(upload_url, headers=upload_headers, content=image_data)
+    upload_resp = await client.put(upload_url, headers=_upload_headers(headers), content=image_data)
     upload_resp.raise_for_status()
 
     return image_urn
+
+# --- Helper: Document Upload (Documents API) ---
+
+async def upload_document(client: httpx.AsyncClient, headers: dict, person_urn: str, file_source: str) -> str:
+    """Upload a PDF via LinkedIn Documents API and return its urn:li:document:XXX.
+
+    Same three-step shape as images, against /rest/documents.
+    """
+    rest_base = settings.api_base.replace("/v2", "/rest")
+
+    init_resp = await client.post(
+        f"{rest_base}/documents?action=initializeUpload",
+        headers=_rest_headers(headers),
+        json={"initializeUploadRequest": {"owner": person_urn}},
+    )
+    init_resp.raise_for_status()
+    value = init_resp.json()["value"]
+    upload_url = value["uploadUrl"]
+    document_urn = value["document"]
+
+    if file_source.startswith("http"):
+        doc_resp = await client.get(file_source, timeout=120.0)
+        doc_resp.raise_for_status()
+        document_data = doc_resp.content
+    else:
+        if not os.path.exists(file_source):
+            raise FileNotFoundError(f"Document file not found: {file_source}")
+        with open(file_source, "rb") as f:
+            document_data = f.read()
+
+    upload_resp = await client.put(
+        upload_url, headers=_upload_headers(headers), content=document_data, timeout=180.0
+    )
+    upload_resp.raise_for_status()
+
+    return document_urn
 
 # --- Post Implementation (Posts API) ---
 
@@ -128,10 +203,7 @@ async def create_image_post(params: ImagePostParams) -> str:
 
         async with httpx.AsyncClient() as client:
             # 1. Get User ID
-            user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
-            user_resp.raise_for_status()
-            person_id = user_resp.json().get("sub")
-            author_urn = f"urn:li:person:{person_id}"
+            author_urn = await get_author_urn(client, headers)
 
             # 2. Upload Image via Images API
             image_urn = await upload_image(client, headers, author_urn, params.image_source)
@@ -168,6 +240,50 @@ async def create_image_post(params: ImagePostParams) -> str:
     except Exception as e:
         return handle_api_error(e)
 
+async def create_document_post(params: DocumentPostParams) -> str:
+    """Create a document (PDF carousel) post via Posts API (/rest/posts).
+
+    LinkedIn renders each PDF page as a swipeable card, keeping the reader
+    in-feed. Document posts are ranked largely on dwell time, so a multi-page
+    PDF typically out-reaches the same content as plain text.
+    """
+    try:
+        headers = await get_headers()
+        rest_base = settings.api_base.replace("/v2", "/rest")
+
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            author_urn = await get_author_urn(client, headers)
+            document_urn = await upload_document(client, headers, author_urn, params.file_source)
+            commentary = build_mention_commentary(params.text, params.mentions)
+
+            payload = {
+                "author": author_urn,
+                "commentary": commentary,
+                "visibility": params.visibility,
+                "distribution": {
+                    "feedDistribution": "MAIN_FEED",
+                    "targetEntities": [],
+                    "thirdPartyDistributionChannels": [],
+                },
+                # 'title' is the label shown above the carousel in the feed.
+                "content": {"media": {"id": document_urn, "title": params.title}},
+                "lifecycleState": "PUBLISHED",
+                "isReshareDisabledByAuthor": False,
+            }
+
+            resp = await client.post(f"{rest_base}/posts", headers=_rest_headers(headers), json=payload)
+            resp.raise_for_status()
+
+            post_id = resp.headers.get("x-restli-id", "unknown")
+            return (
+                f"✅ Document post created successfully.\n"
+                f"ID: {post_id}\n"
+                f"URL: https://www.linkedin.com/feed/update/{post_id}/"
+            )
+
+    except Exception as e:
+        return handle_api_error(e)
+
 async def create_post(params: PostParams) -> str:
     """Create a new text-based update on the user LinkedIn feed via Posts API (/rest/posts)."""
     try:
@@ -177,10 +293,7 @@ async def create_post(params: PostParams) -> str:
 
         async with httpx.AsyncClient() as client:
             # 1. Get User ID
-            user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
-            user_resp.raise_for_status()
-            person_id = user_resp.json().get("sub")
-            author = f"urn:li:person:{person_id}"
+            author = await get_author_urn(client, headers)
 
             # 2. Build commentary with inline mentions
             commentary = build_mention_commentary(params.text, params.mentions)
@@ -252,7 +365,12 @@ async def delete_post(post_urn: str) -> str:
         return handle_api_error(e)
 
 async def get_recent_posts() -> str:
-    """List the user's recent posts via Posts API."""
+    """List the user's recent posts via Posts API.
+
+    NOTE: the author finder on /rest/posts is gated behind LinkedIn partner
+    access — a standard app gets 403 partnerApiPostsExternal.FINDER-author.
+    Creating posts works fine; only listing them back is restricted.
+    """
     try:
         headers = await get_headers()
         rest_base = settings.api_base.replace("/v2", "/rest")
@@ -260,10 +378,7 @@ async def get_recent_posts() -> str:
 
         async with httpx.AsyncClient() as client:
             # 1. Get Author URN
-            user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
-            user_resp.raise_for_status()
-            person_id = user_resp.json().get("sub")
-            author_urn = f"urn:li:person:{person_id}"
+            author_urn = await get_author_urn(client, headers)
 
             # 2. Fetch posts
             encoded_author = quote(author_urn)
@@ -294,10 +409,7 @@ async def create_comment(params: CommentParams) -> str:
     try:
         headers = await get_headers()
         async with httpx.AsyncClient() as client:
-            user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
-            user_resp.raise_for_status()
-            person_id = user_resp.json().get("sub")
-            actor_urn = f"urn:li:person:{person_id}"
+            actor_urn = await get_author_urn(client, headers)
 
             encoded_object = quote(params.object_urn)
             url = f"{settings.api_base}/socialActions/{encoded_object}/comments"
@@ -321,10 +433,7 @@ async def create_reaction(params: ReactionParams) -> str:
     try:
         headers = await get_headers()
         async with httpx.AsyncClient() as client:
-            user_resp = await client.get(f"{settings.api_base}/userinfo", headers=headers)
-            user_resp.raise_for_status()
-            person_id = user_resp.json().get("sub")
-            actor_urn = f"urn:li:person:{person_id}"
+            actor_urn = await get_author_urn(client, headers)
 
             encoded_object = quote(params.object_urn)
             url = f"{settings.api_base}/socialActions/{encoded_object}/likes"
